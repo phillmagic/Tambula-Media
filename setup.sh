@@ -34,14 +34,18 @@ echo ""
 
 echo "Installing dependencies..."
 apt-get update
-apt-get install -y python3 python3-pip vlc syncthing
+apt-get install -y python3 python3-pip vlc syncthing python3-full python3-venv
 
 echo "Creating signage directory..."
 mkdir -p /home/pi/signage
 cd /home/pi/signage
 
-echo "Installing Python packages..."
-pip3 install requests python-dotenv
+echo "Creating Python virtual environment..."
+python3 -m venv signage-env
+source signage-env/bin/activate
+
+echo "Installing Python packages in virtual environment..."
+./signage-env/bin/pip install requests python-dotenv
 
 echo "Downloading signage client..."
 if [ "$DEVICE_TYPE" = "server" ]; then
@@ -260,7 +264,7 @@ After=network.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/signage
-ExecStart=/usr/bin/python3 /home/pi/signage/$CLIENT_SCRIPT
+ExecStart=/home/pi/signage/signage-env/bin/python /home/pi/signage/$CLIENT_SCRIPT
 Restart=always
 RestartSec=10
 
