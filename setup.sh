@@ -27,12 +27,22 @@ echo "deb [signed-by=/usr/share/keyrings/syncthing-archive-keyring.gpg] https://
 apt-get update
 apt-get install -y syncthing
 
-# Determine device type
+# Determine device type with proper input handling
 echo ""
 echo "Select device type:"
 echo "1) Server Device (downloads and shares videos automatically)"
 echo "2) Client Device (receives and plays videos automatically)"
-read -p "Enter choice (1 or 2): " device_choice
+
+# Use /dev/tty to ensure we can read input even when running as root
+device_choice=""
+while [ -z "$device_choice" ] || [[ ! "$device_choice" =~ ^[12]$ ]]; do
+    echo -n "Enter choice (1 or 2): "
+    read device_choice < /dev/tty
+    if [[ ! "$device_choice" =~ ^[12]$ ]]; then
+        echo "Invalid choice. Please enter 1 or 2."
+        device_choice=""
+    fi
+done
 
 case $device_choice in
     1)
@@ -44,13 +54,20 @@ case $device_choice in
     2)
         DEVICE_TYPE="client"
         SCRIPT_NAME="signage-client.py"
-        read -p "Enter server IP address (e.g., 192.168.1.100): " server_ip
+        
+        # Get server IP with proper input handling
+        server_ip=""
+        while [ -z "$server_ip" ]; do
+            echo -n "Enter server IP address (e.g., 192.168.1.100): "
+            read server_ip < /dev/tty
+            if [ -z "$server_ip" ]; then
+                echo "Server IP cannot be empty. Please try again."
+            fi
+        done
+        
         SERVER_IP_LINE="SERVER_IP=$server_ip"
         echo "Setting up as CLIENT device with auto-configuration..."
-        ;;
-    *)
-        echo "Invalid choice. Exiting."
-        exit 1
+        echo "Server IP: $server_ip"
         ;;
 esac
 
@@ -168,6 +185,18 @@ class SignageServer:
         except Exception as e:
             logging.error(f"Could not determine local IP: {e}")
             return None
+    
+    def _test_supabase_connection(self) -> bool:
+        """Test Supabase connection"""
+        try:
+            test_url = f"{self.supabase_url}/rest/v1/devices"
+            params = {'select': 'count', 'limit': '1'}
+            
+            response = requests.get(test_url, headers=self.headers, params=params, timeout=10)
+            return response.status_code == 200
+        except Exception as e:
+            logging.warning(f"Supabase connection test failed: {e}")
+            return False
     
     def setup_syncthing(self) -> bool:
         """Setup Syncthing server with auto-configuration"""
@@ -311,7 +340,169 @@ class SignageServer:
         except Exception as e:
             logging.error(f"❌ Error configuring Syncthing: {e}")
     
-    # ... (rest of the server methods remain the same)
+    def register_device(self) -> bool:
+        """Register server device in database"""
+        try:
+            if not self._test_supabase_connection():
+                return False
+            
+            check_url = f"{self.supabase_url}/rest/v1/devices"
+            params = {'device_id': f'eq.{self.device_id}', 'select': 'id'}
+            
+            response = requests.get(check_url, headers=self.headers, params=params, timeout=10)
+            
+            device_data = {
+                'device_name': self.device_name,
+                'device_type': 'server',
+                'group_id': self.group_id,
+                'status': 'online',
+                'ip_address': self._get_local_ip(),
+                'last_seen': datetime.now(timezone.utc).isoformat(),
+                'updated_at': datetime.now(timezone.utc).isoformat()
+            }
+            
+            if response.status_code == 200 and response.json():
+                # Update existing device
+                update_url = f"{self.supabase_url}/rest/v1/devices"
+                params = {'device_id': f'eq.{self.device_id}'}
+                
+                response = requests.patch(
+                    update_url,
+                    headers=self.headers,
+                    params=params,
+                    json=device_data,
+                    timeout=10
+                )
+                
+                return response.status_code in [200, 204]
+            else:
+                # Create new device
+                device_data['device_id'] = self.device_id
+                
+                create_url = f"{self.supabase_url}/rest/v1/devices"
+                
+                response = requests.post(
+                    create_url,
+                    headers=self.headers,
+                    json=device_data,
+                    timeout=10
+                )
+                
+                return response.status_code in [200, 201]
+                
+        except Exception as e:
+            logging.error(f"Error registering device: {e}")
+            return False
+    
+    def get_all_group_videos(self) -> List[Dict]:
+        """Get all videos for all active schedules in this group"""
+        try:
+            if not self._test_supabase_connection():
+                return []
+            
+            # Get active schedules
+            schedules_url = f"{self.supabase_url}/rest/v1/schedules"
+            schedules_params = {
+                'group_id': f'eq.{self.group_id}',
+                'is_active': 'eq.true',
+                'select': 'playlist_id'
+            }
+            
+            schedules_response = requests.get(schedules_url, headers=self.headers, params=schedules_params, timeout=10)
+            
+            if schedules_response.status_code != 200:
+                return []
+            
+            schedules = schedules_response.json()
+            if not schedules:
+                return []
+            
+            # Get unique playlist IDs
+            playlist_ids = list(set([s['playlist_id'] for s in schedules if s.get('playlist_id')]))
+            
+            if not playlist_ids:
+                return []
+            
+            # Get videos from playlists
+            playlist_videos_url = f"{self.supabase_url}/rest/v1/playlist_videos"
+            playlist_videos_params = {
+                'playlist_id': f'in.({",".join(playlist_ids)})',
+                'select': '*,videos(*)'
+            }
+            
+            playlist_videos_response = requests.get(playlist_videos_url, headers=self.headers, params=playlist_videos_params, timeout=10)
+            
+            if playlist_videos_response.status_code != 200:
+                return []
+            
+            playlist_videos = playlist_videos_response.json()
+            
+            # Extract unique videos
+            videos = []
+            seen_ids = set()
+            
+            for pv in playlist_videos:
+                if pv.get('videos'):
+                    video = pv['videos']
+                    if video['id'] not in seen_ids:
+                        videos.append(video)
+                        seen_ids.add(video['id'])
+            
+            return videos
+            
+        except Exception as e:
+            logging.error(f"Error fetching group videos: {e}")
+            return []
+    
+    def download_video(self, video: Dict) -> Optional[Path]:
+        """Download a video file from Supabase storage"""
+        try:
+            video_path = self.video_dir / video['filename']
+            
+            if video_path.exists():
+                return video_path
+            
+            storage_url = f"{self.supabase_url}/storage/v1/object/public/videos/{video['file_path']}"
+            
+            logging.info(f"📥 Downloading: {video['title']}")
+            response = requests.get(storage_url, stream=True, timeout=30)
+            
+            if response.status_code == 200:
+                with open(video_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                logging.info(f"✅ Downloaded: {video['filename']}")
+                return video_path
+            else:
+                logging.error(f"❌ Failed to download: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            logging.error(f"❌ Error downloading video: {e}")
+            return None
+    
+    def sync_all_videos(self):
+        """Download all videos for the group"""
+        try:
+            videos = self.get_all_group_videos()
+            
+            if not videos:
+                logging.warning("No videos found for this group")
+                return
+            
+            logging.info(f"📹 Found {len(videos)} videos to sync")
+            
+            downloaded_count = 0
+            for video in videos:
+                result = self.download_video(video)
+                if result and result.exists():
+                    downloaded_count += 1
+            
+            logging.info(f"✅ Video sync completed ({downloaded_count} videos)")
+            
+        except Exception as e:
+            logging.error(f"❌ Error syncing videos: {e}")
     
     def run(self):
         """Main server loop"""
@@ -325,18 +516,38 @@ class SignageServer:
             else:
                 logging.warning("⚠️  Running without Syncthing")
             
+            # Register device
+            if self.register_device():
+                logging.info("✅ Device registered")
+            else:
+                logging.warning("⚠️  Device registration failed")
+            
+            # Initial video sync
+            logging.info("🔄 Starting initial video sync...")
+            self.sync_all_videos()
+            
             logging.info("🎯 Server startup completed!")
             logging.info("📊 Server running with automatic video sharing")
             if syncthing_success:
                 logging.info(f"🌐 Syncthing UI: http://{self._get_local_ip()}:8384")
                 logging.info("📁 Videos folder is automatically shared with clients")
             
-            # Main loop (simplified for example)
+            # Main loop
             while True:
                 try:
-                    time.sleep(60)
+                    self.register_device()
+                    
+                    # Sync videos every 5 minutes
+                    if int(time.time()) % 300 == 0:
+                        self.sync_all_videos()
+                    
+                    time.sleep(self.check_interval)
+                    
                 except KeyboardInterrupt:
                     break
+                except Exception as e:
+                    logging.error(f"❌ Error in main loop: {e}")
+                    time.sleep(self.check_interval)
         
         except Exception as e:
             logging.error(f"💥 Fatal error: {e}")
@@ -410,6 +621,10 @@ class DigitalSignageClient:
         try:
             logger.info("🔧 Starting Syncthing with auto-configuration...")
             
+            # Kill existing processes
+            subprocess.run(['pkill', '-f', 'syncthing'], capture_output=True)
+            time.sleep(2)
+            
             # Start Syncthing
             self.syncthing_process = subprocess.Popen([
                 'syncthing', '--no-browser', '--gui-address=0.0.0.0:8384'
@@ -445,22 +660,197 @@ class DigitalSignageClient:
             # Wait for Syncthing to be fully ready
             time.sleep(10)
             
-            # Auto-configuration logic would go here
-            # For now, just mark as configured
-            self.syncthing_configured = True
-            logger.info("✅ Syncthing auto-configuration completed")
-            logger.info(f"📁 Videos will sync from server at: {SERVER_IP}")
+            api_url = "http://localhost:8384/rest"
+            
+            # Get server device ID by connecting to server API
+            try:
+                server_api_url = f"http://{SERVER_IP}:8384/rest"
+                server_status_response = requests.get(f"{server_api_url}/system/status", timeout=10)
+                
+                if server_status_response.status_code == 200:
+                    server_device_id = server_status_response.json().get('myID')
+                    
+                    if server_device_id:
+                        logger.info(f"📱 Found server device ID: {server_device_id}")
+                        
+                        # Add server device to our config
+                        self.add_device_to_syncthing(api_url, server_device_id, "Server")
+                        
+                        # Configure videos folder
+                        self.configure_videos_folder(api_url, server_device_id)
+                        
+                        self.syncthing_configured = True
+                        logger.info("✅ Syncthing auto-configuration completed")
+                    else:
+                        logger.warning("Could not get server device ID")
+                else:
+                    logger.warning(f"Could not connect to server Syncthing: {server_status_response.status_code}")
+                    
+            except Exception as e:
+                logger.warning(f"Could not auto-configure with server: {e}")
+                logger.info("Manual configuration may be required via Syncthing UI")
                 
         except Exception as e:
             logger.error(f"Error in auto-configuration: {e}")
+    
+    def add_device_to_syncthing(self, api_url, device_id, device_name):
+        """Add a device to Syncthing configuration"""
+        try:
+            # Get current config
+            config_response = requests.get(f"{api_url}/system/config", timeout=10)
+            if config_response.status_code != 200:
+                return False
+            
+            config = config_response.json()
+            
+            # Check if device already exists
+            for device in config.get('devices', []):
+                if device.get('deviceID') == device_id:
+                    logger.info(f"Device {device_name} already exists")
+                    return True
+            
+            # Add new device
+            new_device = {
+                "deviceID": device_id,
+                "name": device_name,
+                "addresses": ["dynamic"],
+                "compression": "metadata",
+                "certName": "",
+                "introducer": False,
+                "skipIntroductionRemovals": False,
+                "introducedBy": "",
+                "paused": False,
+                "allowedNetworks": [],
+                "autoAcceptFolders": True,
+                "maxSendKbps": 0,
+                "maxRecvKbps": 0,
+                "ignoredFolders": [],
+                "pendingFolders": [],
+                "maxRequestKiB": 0
+            }
+            
+            config['devices'].append(new_device)
+            
+            # Update config
+            response = requests.post(f"{api_url}/system/config", 
+                                   json=config, 
+                                   headers={'Content-Type': 'application/json'},
+                                   timeout=10)
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Added device: {device_name}")
+                return True
+            else:
+                logger.error(f"Failed to add device: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error adding device: {e}")
+            return False
+    
+    def configure_videos_folder(self, api_url, server_device_id):
+        """Configure videos folder for receiving from server"""
+        try:
+            # Get current config
+            config_response = requests.get(f"{api_url}/system/config", timeout=10)
+            if config_response.status_code != 200:
+                return False
+            
+            config = config_response.json()
+            
+            # Check if videos folder already exists
+            for folder in config.get('folders', []):
+                if folder.get('id') == 'videos':
+                    logger.info("Videos folder already configured")
+                    return True
+            
+            # Get our device ID
+            status_response = requests.get(f"{api_url}/system/status", timeout=10)
+            if status_response.status_code != 200:
+                return False
+            
+            our_device_id = status_response.json().get('myID')
+            
+            # Add videos folder (receive-only)
+            new_folder = {
+                "id": "videos",
+                "label": "Videos",
+                "filesystemType": "basic",
+                "path": str(VIDEO_DIR.absolute()),
+                "type": "receiveonly",
+                "devices": [
+                    {"deviceID": our_device_id, "introducedBy": "", "encryptionPassword": ""},
+                    {"deviceID": server_device_id, "introducedBy": "", "encryptionPassword": ""}
+                ],
+                "rescanIntervalS": 3600,
+                "fsWatcherEnabled": True,
+                "fsWatcherDelayS": 10,
+                "ignorePerms": False,
+                "autoNormalize": True,
+                "minDiskFree": {"value": 1, "unit": "%"},
+                "versioning": {"type": "", "params": {}},
+                "copiers": 0,
+                "pullerMaxPendingKiB": 0,
+                "hashers": 0,
+                "order": "random",
+                "ignoreDelete": False,
+                "scanProgressIntervalS": 0,
+                "pullerPauseS": 0,
+                "maxConflicts": 10,
+                "disableSparseFiles": False,
+                "disableTempIndexes": False,
+                "paused": False,
+                "weakHashThresholdPct": 25,
+                "markerName": ".stfolder",
+                "copyOwnershipFromParent": False,
+                "modTimeWindowS": 0,
+                "maxConcurrentWrites": 2,
+                "disableFsync": False,
+                "blockPullOrder": "standard",
+                "copyRangeMethod": "standard",
+                "caseSensitiveFS": True,
+                "junctionsAsDirs": False,
+                "syncOwnership": False,
+                "sendOwnership": False,
+                "syncXattrs": False,
+                "sendXattrs": False
+            }
+            
+            config['folders'].append(new_folder)
+            
+            # Update config
+            response = requests.post(f"{api_url}/system/config", 
+                                   json=config, 
+                                   headers={'Content-Type': 'application/json'},
+                                   timeout=10)
+            
+            if response.status_code == 200:
+                logger.info(f"✅ Videos folder configured: {VIDEO_DIR.absolute()}")
+                
+                # Restart Syncthing to apply changes
+                requests.post(f"{api_url}/system/restart", timeout=10)
+                time.sleep(5)
+                
+                return True
+            else:
+                logger.error(f"Failed to configure videos folder: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error configuring videos folder: {e}")
+            return False
     
     def play_video(self, video_path):
         """Play video using VLC"""
         try:
             if self.vlc_process:
                 self.vlc_process.terminate()
+                try:
+                    self.vlc_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.vlc_process.kill()
             
-            cmd = ['vlc', '--intf', 'dummy', '--fullscreen', '--no-video-title-show', '--loop', str(video_path)]
+            cmd = ['vlc', '--intf', 'dummy', '--fullscreen', '--no-video-title-show', '--loop', '--quiet', str(video_path)]
             self.vlc_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.current_video = video_path
             logger.info(f"▶️  Playing video: {video_path.name}")
