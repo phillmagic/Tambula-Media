@@ -113,6 +113,16 @@ print_success "System updated"
 
 print_header "INSTALLING DEPENDENCIES"
 
+# Detect if we're on Desktop or Lite
+print_info "Detecting Raspberry Pi OS variant..."
+if dpkg -l | grep -q raspberrypi-ui-mods; then
+    OS_VARIANT="Desktop"
+    print_success "Detected: Raspberry Pi OS Desktop"
+else
+    OS_VARIANT="Lite"
+    print_success "Detected: Raspberry Pi OS Lite"
+fi
+
 # Common dependencies
 print_info "Installing Python and common tools..."
 apt-get install -y -qq \
@@ -120,13 +130,24 @@ apt-get install -y -qq \
     python3-pip \
     python3-venv \
     curl \
-    git \
-    unclutter \
-    xdotool \
-    x11-xserver-utils
+    git
 
-# Detect and install chromium (for client)
+# Client-specific packages
 if [ "$INSTALL_TYPE" = "client" ]; then
+    print_info "Installing client dependencies..."
+    
+    # Install X11 if on Lite (Desktop already has it)
+    if [ "$OS_VARIANT" = "Lite" ]; then
+        print_info "Installing minimal X11 for Pi OS Lite..."
+        apt-get install --no-install-recommends -y -qq \
+            xserver-xorg \
+            x11-xserver-utils \
+            xinit \
+            xterm
+        print_success "X11 server installed"
+    fi
+    
+    # Install Chromium
     print_info "Installing Chromium..."
     if apt-cache show chromium &> /dev/null; then
         apt-get install -y -qq chromium
@@ -135,6 +156,17 @@ if [ "$INSTALL_TYPE" = "client" ]; then
     else
         print_warning "Chromium not found in apt, may need manual installation"
     fi
+    
+    # Install kiosk utilities
+    apt-get install -y -qq \
+        unclutter \
+        xdotool \
+        x11-xserver-utils
+    
+    print_success "Client dependencies installed"
+else
+    # Server doesn't need X11 or Chromium
+    print_info "Server mode - skipping GUI packages"
 fi
 
 print_success "Dependencies installed"
@@ -377,11 +409,15 @@ EOFSCRIPT
     chown "$ACTUAL_USER:$ACTUAL_USER" "$INSTALL_DIR/start-signage-kiosk.sh"
     chmod +x "$INSTALL_DIR/start-signage-kiosk.sh"
     
-    # Create desktop autostart
-    AUTOSTART_DIR="$ACTUAL_HOME/.config/autostart"
-    sudo -u "$ACTUAL_USER" mkdir -p "$AUTOSTART_DIR"
-    
-    cat > "$AUTOSTART_DIR/tambula-signage.desktop" << EOF
+    # Configure auto-start based on OS variant
+    if [ "$OS_VARIANT" = "Desktop" ]; then
+        print_info "Configuring Desktop autostart..."
+        
+        # Create desktop autostart
+        AUTOSTART_DIR="$ACTUAL_HOME/.config/autostart"
+        sudo -u "$ACTUAL_USER" mkdir -p "$AUTOSTART_DIR"
+        
+        cat > "$AUTOSTART_DIR/tambula-signage.desktop" << EOF
 [Desktop Entry]
 Type=Application
 Name=Tambula Signage Kiosk
@@ -391,8 +427,41 @@ Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
 EOF
+        
+        chown "$ACTUAL_USER:$ACTUAL_USER" "$AUTOSTART_DIR/tambula-signage.desktop"
+        print_success "Desktop autostart configured"
+        
+    else
+        print_info "Configuring Pi OS Lite autostart..."
+        
+        # Create .xinitrc to start kiosk
+        cat > "$ACTUAL_HOME/.xinitrc" << EOF
+#!/bin/bash
+# Tambula Signage - X11 startup
+exec $INSTALL_DIR/start-signage-kiosk.sh
+EOF
+        chown "$ACTUAL_USER:$ACTUAL_USER" "$ACTUAL_HOME/.xinitrc"
+        chmod +x "$ACTUAL_HOME/.xinitrc"
+        
+        # Configure .bash_profile to auto-start X on tty1
+        if ! grep -q "startx" "$ACTUAL_HOME/.bash_profile" 2>/dev/null; then
+            cat >> "$ACTUAL_HOME/.bash_profile" << 'EOF'
+
+# Tambula Signage - Auto-start X11 on tty1
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
+    startx
+fi
+EOF
+            chown "$ACTUAL_USER:$ACTUAL_USER" "$ACTUAL_HOME/.bash_profile"
+        fi
+        
+        # Enable auto-login on console
+        print_info "Enabling auto-login..."
+        raspi-config nonint do_boot_behaviour B2 2>/dev/null || true
+        
+        print_success "Pi OS Lite autostart configured"
+    fi
     
-    chown "$ACTUAL_USER:$ACTUAL_USER" "$AUTOSTART_DIR/tambula-signage.desktop"
     print_success "Kiosk mode configured"
     
     # Configure HDMI audio
