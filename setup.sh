@@ -355,7 +355,7 @@ if [ "$INSTALL_TYPE" = "client" ]; then
     # Create kiosk startup script
     cat > "$INSTALL_DIR/start-signage-kiosk.sh" << 'EOFSCRIPT'
 #!/bin/bash
-# Tambula Digital Signage - Chromium Kiosk Startup
+# Tambula Digital Signage - Chromium Kiosk Startup (Pi OS Desktop & Lite Compatible)
 
 # Wait for server to be ready
 echo "$(date): Waiting for signage server..." >> $HOME/signage/logs/kiosk.log
@@ -367,10 +367,23 @@ for i in {1..60}; do
     sleep 2
 done
 
+# Set display
+export DISPLAY=:0
+
+# Force display resolution (helps Pi OS Lite)
+echo "$(date): Configuring display..." >> $HOME/signage/logs/kiosk.log
+xrandr --output HDMI-1 --mode 1920x1080 --rate 60 --primary 2>/dev/null || \
+xrandr --output HDMI-2 --mode 1920x1080 --rate 60 --primary 2>/dev/null || \
+xrandr --output HDMI-0 --mode 1920x1080 --rate 60 --primary 2>/dev/null || \
+echo "$(date): Using default resolution" >> $HOME/signage/logs/kiosk.log
+
+# Log display info
+xdpyinfo | grep dimensions >> $HOME/signage/logs/kiosk.log 2>&1 || true
+
 # Disable screen blanking
-xset s off
-xset -dpms
-xset s noblank
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+xset s noblank 2>/dev/null || true
 
 # Hide cursor
 unclutter -idle 3 &
@@ -385,9 +398,15 @@ else
     exit 1
 fi
 
-# Launch Chromium in kiosk mode
+echo "$(date): Launching Chromium..." >> $HOME/signage/logs/kiosk.log
+
+# Launch Chromium in kiosk mode with Pi OS Lite optimizations
 $CHROMIUM_CMD \
     --kiosk \
+    --window-size=1920,1080 \
+    --window-position=0,0 \
+    --force-device-scale-factor=1 \
+    --display=:0 \
     --start-fullscreen \
     --noerrdialogs \
     --disable-infobars \
@@ -400,8 +419,12 @@ $CHROMIUM_CMD \
     --autoplay-policy=no-user-gesture-required \
     --password-store=basic \
     --use-mock-keychain \
+    --disable-gpu-vsync \
+    --enable-features=VaapiVideoDecoder \
     --app=http://localhost:8080 \
     >> $HOME/signage/logs/kiosk.log 2>&1 &
+
+echo "$(date): Chromium launched" >> $HOME/signage/logs/kiosk.log
 
 wait
 EOFSCRIPT
@@ -434,10 +457,18 @@ EOF
     else
         print_info "Configuring Pi OS Lite autostart..."
         
-        # Create .xinitrc to start kiosk
+        # Optional: Install lightweight window manager for better display handling
+        print_info "Installing Openbox window manager (improves fullscreen on Lite)..."
+        apt-get install -y -qq openbox
+        print_success "Openbox installed"
+        
+        # Create .xinitrc to start openbox + kiosk
         cat > "$ACTUAL_HOME/.xinitrc" << EOF
 #!/bin/bash
-# Tambula Signage - X11 startup
+# Tambula Signage - X11 startup with Openbox
+# Openbox provides proper window management for fullscreen
+openbox &
+sleep 1
 exec $INSTALL_DIR/start-signage-kiosk.sh
 EOF
         chown "$ACTUAL_USER:$ACTUAL_USER" "$ACTUAL_HOME/.xinitrc"
