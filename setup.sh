@@ -419,8 +419,12 @@ $CHROMIUM_CMD \
     --autoplay-policy=no-user-gesture-required \
     --password-store=basic \
     --use-mock-keychain \
-    --disable-gpu-vsync \
+    --use-gl=egl \
     --enable-features=VaapiVideoDecoder \
+    --enable-gpu-rasterization \
+    --enable-oop-rasterization \
+    --ignore-gpu-blocklist \
+    --enable-zero-copy \
     --app=http://localhost:8080 \
     >> $HOME/signage/logs/kiosk.log 2>&1 &
 
