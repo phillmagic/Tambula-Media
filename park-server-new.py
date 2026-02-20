@@ -91,6 +91,7 @@ server_state = {
     'total_files': 0,
     'total_size': 0,
     'schedules': [],
+    'schedule_items': [],
     'playlists': {},
     'settings': {},
     'manifest': {},
@@ -413,6 +414,33 @@ class EnhancedParkServer:
             server_state['schedules'] = response.json()
             logging.info(f"📅 Found {len(server_state['schedules'])} schedules")
             
+            # Get schedule_items for active schedules
+            schedule_ids = [s['id'] for s in server_state['schedules'] if s.get('is_active', False)]
+            
+            if not schedule_ids:
+                logging.warning("⚠️  No active schedules found")
+                return False
+            
+            url = f"{SUPABASE_URL}/rest/v1/schedule_items"
+            params = {
+                'schedule_id': f'in.({",".join(schedule_ids)})',
+                'select': '*',
+                'order': 'start_time'
+            }
+            response = requests.get(url, headers=HEADERS, params=params, timeout=10)
+            
+            if response.status_code != 200:
+                logging.error(f"Failed to get schedule items: {response.text}")
+                return False
+            
+            schedule_items = response.json()
+            server_state['schedule_items'] = schedule_items
+            logging.info(f"📋 Found {len(schedule_items)} schedule items")
+            
+            # Extract unique playlist IDs from schedule_items
+            playlist_ids = list(set([item['playlist_id'] for item in schedule_items]))
+            logging.info(f"📁 Unique playlists in schedules: {len(playlist_ids)}")
+            
             # Get all playlists - using simple table name (this is correct)
             url = f"{SUPABASE_URL}/rest/v1/playlists"
             params = {'select': '*'}
@@ -459,10 +487,13 @@ class EnhancedParkServer:
             with open(CACHE_DIR / 'schedules.json', 'w') as f:
                 json.dump(server_state['schedules'], f, indent=2)
             
+            with open(CACHE_DIR / 'schedule_items.json', 'w') as f:
+                json.dump(server_state['schedule_items'], f, indent=2)
+            
             with open(CACHE_DIR / 'playlists.json', 'w') as f:
                 json.dump(server_state['playlists'], f, indent=2)
             
-            logging.info(f"✅ Synced {len(server_state['schedules'])} schedules, {len(server_state['playlists'])} playlists")
+            logging.info(f"✅ Synced {len(server_state['schedules'])} schedules, {len(schedule_items)} items, {len(server_state['playlists'])} playlists")
             return True
             
         except Exception as e:

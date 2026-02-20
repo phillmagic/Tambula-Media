@@ -671,6 +671,7 @@ class SignageClient:
         
         # Data storage
         self.schedules = []
+        self.schedule_items = []
         self.playlists_data = {}
         self.advert_playlists = {}
         self.settings = {}
@@ -800,6 +801,12 @@ class SignageClient:
                     json.dump(self.schedules, f, indent=2)
                 logging.debug("💾 Saved schedules to cache")
             
+            # Save schedule_items
+            if self.schedule_items:
+                with open(cache_dir / 'schedule_items.json', 'w') as f:
+                    json.dump(self.schedule_items, f, indent=2)
+                logging.debug("💾 Saved schedule_items to cache")
+            
             # Save playlists
             if self.playlists_data:
                 with open(cache_dir / 'playlists.json', 'w') as f:
@@ -836,6 +843,16 @@ class SignageClient:
                 logging.info(f"📋 Loaded {len(self.schedules)} schedules from cache")
             else:
                 return False
+            
+            # Load schedule_items
+            schedule_items_file = cache_dir / 'schedule_items.json'
+            if schedule_items_file.exists():
+                with open(schedule_items_file, 'r') as f:
+                    self.schedule_items = json.load(f)
+                logging.info(f"📋 Loaded {len(self.schedule_items)} schedule items from cache")
+            else:
+                self.schedule_items = []
+                logging.warning("⚠️  No schedule_items cache found, will use empty list")
             
             # Load playlists
             playlists_file = cache_dir / 'playlists.json'
@@ -887,25 +904,48 @@ class SignageClient:
             self.schedules = response.json()
             logging.info(f"📅 Found {len(self.schedules)} schedules")
             
-            # Check for advert settings in schedules - uses interrupt_duration as interval
+            # Get schedule_items for active schedules
+            active_schedule_ids = [s['id'] for s in self.schedules if s.get('is_active', False)]
+            
+            if not active_schedule_ids:
+                logging.warning("⚠️  No active schedules found")
+                self.schedule_items = []
+            else:
+                url = f"{self.supabase_url}/rest/v1/schedule_items"
+                params = {
+                    'schedule_id': f'in.({",".join(active_schedule_ids)})',
+                    'select': '*',
+                    'order': 'start_time'
+                }
+                response = requests.get(url, headers=self.headers, params=params, timeout=10)
+                
+                if response.status_code != 200:
+                    logging.error(f"Failed to get schedule items: {response.text}")
+                    return False
+                
+                self.schedule_items = response.json()
+                logging.info(f"📋 Found {len(self.schedule_items)} schedule items")
+            
+            # Check for advert/interruption settings in schedules
             advert_settings_found = False
             for schedule in self.schedules:
-                interrupt_duration = schedule.get('interrupt_duration')
-                advert_playlist_id = schedule.get('advert_playlist_id')
-                
-                if interrupt_duration and interrupt_duration > 0:
-                    self.advert_enabled = True
-                    self.advert_interval = interrupt_duration  # Use interrupt_duration as the interval
-                    self.advert_duration = 30  # Default duration for each advert
-                    advert_settings_found = True
-                    logging.info(f"📺 Advert settings loaded: {interrupt_duration}s interval, {self.advert_duration}s duration")
-                    if advert_playlist_id:
-                        logging.info(f"📺 Advert playlist ID: {advert_playlist_id}")
-                    break
+                if schedule.get('is_active', False):
+                    interruption_interval = schedule.get('interruption_interval')
+                    advert_playlist_id = schedule.get('advert_playlist_id')
+                    
+                    if interruption_interval and interruption_interval > 0:
+                        self.advert_enabled = True
+                        self.advert_interval = interruption_interval
+                        self.advert_duration = 30  # Default duration for each advert
+                        advert_settings_found = True
+                        logging.info(f"📺 Interruption settings loaded: {interruption_interval}s interval, {self.advert_duration}s duration")
+                        if advert_playlist_id:
+                            logging.info(f"📺 Advert playlist ID: {advert_playlist_id}")
+                        break
             
             if not advert_settings_found:
                 self.advert_enabled = False
-                logging.info("📺 No advert settings found in schedules")
+                logging.info("📺 No interruption settings found in schedules")
             
             # Get ALL playlists
             url = f"{self.supabase_url}/rest/v1/playlists"
@@ -917,7 +957,10 @@ class SignageClient:
                 return False
             
             all_playlists = response.json()
-            scheduled_playlist_ids = list(set([s['playlist_id'] for s in self.schedules]))
+            
+            # Get unique playlist IDs from schedule_items
+            scheduled_playlist_ids = list(set([item['playlist_id'] for item in self.schedule_items]))
+            logging.info(f"📁 Unique playlists in schedule items: {len(scheduled_playlist_ids)}")
             
             # Process playlists
             self.playlists_data = {}
@@ -961,11 +1004,11 @@ class SignageClient:
             if self.advert_playlists and self.advert_enabled:
                 self.preload_advert_videos()
             
-            logging.info(f"✅ Loaded {len(self.schedules)} schedules, {len(self.playlists_data)} regular playlists, {len(self.advert_playlists)} advert playlists")
+            logging.info(f"✅ Loaded {len(self.schedules)} schedules, {len(self.schedule_items)} schedule items, {len(self.playlists_data)} regular playlists, {len(self.advert_playlists)} advert playlists")
             
             # After successful fetch, save to cache
             self.save_to_cache()
-            return len(self.schedules) > 0 and len(self.playlists_data) > 0
+            return len(self.schedules) > 0 and len(self.schedule_items) > 0
             
         except Exception as e:
             logging.error(f"Error getting schedules/playlists: {e}")
@@ -1010,7 +1053,7 @@ class SignageClient:
         logging.info(f"✅ Pre-downloaded {total_adverts} advert videos")
     
     def get_current_playlist(self):
-        """Get current active playlist"""
+        """Get current active playlist based on schedule_items"""
         now = datetime.now()
         current_time = now.strftime('%H:%M:%S')
         current_day = now.strftime('%A').lower()
@@ -1021,20 +1064,29 @@ class SignageClient:
         }
         current_day_number = day_name_to_number.get(current_day, 1)
         
+        # Check each schedule to see if it's active today
         for schedule in self.schedules:
-            days_of_week = schedule.get('days_of_week', [])
-            day_match = current_day_number in days_of_week
-            
-            if day_match and schedule.get('is_active'):
-                start_time = schedule.get('start_time', '00:00:00')
-                end_time = schedule.get('end_time', '23:59:59')
-                time_match = start_time <= current_time <= end_time
+            if not schedule.get('is_active', False):
+                continue
                 
-                if time_match:
-                    playlist_id = schedule['playlist_id']
+            days_of_week = schedule.get('days_of_week', [])
+            if current_day_number not in days_of_week:
+                continue
+            
+            # Schedule is active today, check schedule_items for current time
+            schedule_id = schedule['id']
+            matching_items = [item for item in self.schedule_items if item['schedule_id'] == schedule_id]
+            
+            for item in matching_items:
+                start_time = item.get('start_time', '00:00:00')
+                end_time = item.get('end_time', '23:59:59')
+                
+                if start_time <= current_time <= end_time:
+                    playlist_id = item['playlist_id']
                     if playlist_id in self.playlists_data:
                         return self.playlists_data[playlist_id]
         
+        # No matching schedule item found - gap in schedule
         return None
     
     def get_next_playlist(self):
@@ -1049,29 +1101,43 @@ class SignageClient:
         }
         current_day_number = day_name_to_number.get(current_day, 1)
         
-        # Find next schedule after current time
-        future_schedules = []
+        # Find next schedule_item after current time
+        future_items = []
+        
         for schedule in self.schedules:
+            if not schedule.get('is_active', False):
+                continue
+                
             days_of_week = schedule.get('days_of_week', [])
-            day_match = current_day_number in days_of_week
+            if current_day_number not in days_of_week:
+                continue
             
-            if day_match and schedule.get('is_active'):
-                start_time = schedule.get('start_time', '00:00:00')
+            # Schedule is active today, find future items
+            schedule_id = schedule['id']
+            matching_items = [item for item in self.schedule_items if item['schedule_id'] == schedule_id]
+            
+            for item in matching_items:
+                start_time = item.get('start_time', '00:00:00')
                 if start_time > current_time:
-                    playlist_id = schedule['playlist_id']
+                    playlist_id = item['playlist_id']
                     if playlist_id in self.playlists_data:
-                        future_schedules.append((start_time, self.playlists_data[playlist_id]))
+                        future_items.append((start_time, self.playlists_data[playlist_id]))
         
-        if future_schedules:
-            future_schedules.sort(key=lambda x: x[0])
-            return future_schedules[0][1]
+        if future_items:
+            future_items.sort(key=lambda x: x[0])
+            return future_items[0][1]
         
-        # If no future schedule today, return first schedule of next day
+        # If no future item today, return first item of any active schedule
         for schedule in self.schedules:
-            if schedule.get('is_active'):
-                playlist_id = schedule['playlist_id']
-                if playlist_id in self.playlists_data:
-                    return self.playlists_data[playlist_id]
+            if schedule.get('is_active', False):
+                schedule_id = schedule['id']
+                matching_items = [item for item in self.schedule_items if item['schedule_id'] == schedule_id]
+                if matching_items:
+                    # Sort by start_time and get first
+                    matching_items.sort(key=lambda x: x.get('start_time', '00:00:00'))
+                    playlist_id = matching_items[0]['playlist_id']
+                    if playlist_id in self.playlists_data:
+                        return self.playlists_data[playlist_id]
         
         return None
     
@@ -1321,6 +1387,7 @@ class SignageClient:
         // Playlist update tracking
         let currentPlaylistVersion = null;
         let currentPlaylistId = null;
+        let pendingScheduleChange = false;
         
         // Analytics tracking
         let videoStartTime = null;
@@ -1507,8 +1574,16 @@ class SignageClient:
                 
                 // Check if playlist changed (different schedule)
                 if (data.playlist_id !== currentPlaylistId) {{
-                    console.log('🔄 Different playlist activated, reloading page...');
-                    location.reload();
+                    console.log('🔄 Schedule changed! Will transition after current video finishes...');
+                    pendingScheduleChange = true;
+                    
+                    // Update status display
+                    const statusDiv = document.getElementById('status');
+                    if (statusDiv) {{
+                        statusDiv.innerHTML = `Current: {current_name}<br>Next: ${{data.playlist_name}}<br><span style="color: #ffa500;">⏳ Pending transition...</span>`;
+                    }}
+                    
+                    showNotification('Schedule changed - will switch after current video');
                     return;
                 }}
                 
@@ -1624,6 +1699,13 @@ class SignageClient:
                 if (lastLoggedVideo && videoStartTime) {{
                     const durationPlayed = (Date.now() - videoStartTime) / 1000;
                     logVideoPlayback(lastLoggedVideo, false, durationPlayed);
+                }}
+                
+                // Check if schedule changed while video was playing
+                if (pendingScheduleChange) {{
+                    console.log('✅ Video finished - switching to new schedule now...');
+                    location.reload();
+                    return;
                 }}
                 
                 currentMainVideoIndex++;
