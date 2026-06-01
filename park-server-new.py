@@ -16,6 +16,7 @@ import threading
 import socket
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 from datetime import datetime
 from typing import Dict, List, Optional
 from dotenv import load_dotenv
@@ -372,7 +373,10 @@ class EnhancedParkServer:
             
             response = requests.get(url, stream=True, timeout=30)
             if response.status_code != 200:
-                logging.error(f"Failed to download {desc}: HTTP {response.status_code}")
+                logging.error(
+                    f"Failed to download {desc}: HTTP {response.status_code} | "
+                    f"URL: {url} | Body: {response.text[:300]}"
+                )
                 return False
             
             # Get file size
@@ -532,8 +536,18 @@ class EnhancedParkServer:
                     logging.info(f"⏭️  Skipping (exists): {filename}")
                     continue
                 
-                # Download video
-                download_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{file_path}"
+                # Build download URL — file_path in DB is stored as a full public URL
+                # (VideoManagement.tsx stores getPublicUrl() result directly), so use it
+                # as-is. For older records stored as a relative path, construct the URL.
+                if file_path and file_path.startswith('http'):
+                    download_url = file_path
+                else:
+                    clean_path = file_path or filename
+                    for prefix in ('videos/', '/videos/'):
+                        if clean_path.startswith(prefix):
+                            clean_path = clean_path[len(prefix):]
+                            break
+                    download_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{quote(clean_path)}"
                 if self.download_file(download_url, local_path, f"Video: {filename}"):
                     downloaded_count += 1
                 else:

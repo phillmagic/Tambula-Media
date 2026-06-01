@@ -734,7 +734,15 @@ class SignageClient:
                 if file_age < 300:  # Less than 5 minutes old
                     return str(local_logo_path)
             
-            download_url = f"{self.supabase_url}/storage/v1/object/public/videos/{logo_path}"
+            if logo_path.startswith('http'):
+                download_url = logo_path
+            else:
+                clean_path = logo_path
+                for prefix in ('videos/', '/videos/'):
+                    if clean_path.startswith(prefix):
+                        clean_path = clean_path[len(prefix):]
+                        break
+                download_url = f"{self.supabase_url}/storage/v1/object/public/videos/{quote(clean_path)}"
             
             logging.info(f"📥 Downloading logo: {logo_path}")
             response = requests.get(download_url, timeout=10)
@@ -1165,8 +1173,16 @@ class SignageClient:
             file_path = video['file_path']
             if not file_path:
                 return None
-                
-            download_url = f"{self.supabase_url}/storage/v1/object/public/videos/{file_path}"
+
+            if file_path.startswith('http'):
+                download_url = file_path
+            else:
+                clean_path = file_path
+                for prefix in ('videos/', '/videos/'):
+                    if clean_path.startswith(prefix):
+                        clean_path = clean_path[len(prefix):]
+                        break
+                download_url = f"{self.supabase_url}/storage/v1/object/public/videos/{quote(clean_path)}"
             
             logging.info(f"⬇️ Downloading: {video['filename']}")
             response = requests.get(download_url, stream=True, timeout=30)
