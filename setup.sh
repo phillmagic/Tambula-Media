@@ -199,7 +199,7 @@ print_success "Downloaded $GITHUB_SCRIPT"
 print_info "Installing Python dependencies..."
 sudo -u "$ACTUAL_USER" python3 -m venv "$INSTALL_DIR/venv"
 sudo -u "$ACTUAL_USER" "$INSTALL_DIR/venv/bin/pip" install --upgrade pip -q
-sudo -u "$ACTUAL_USER" "$INSTALL_DIR/venv/bin/pip" install requests python-dotenv -q
+sudo -u "$ACTUAL_USER" "$INSTALL_DIR/venv/bin/pip" install requests python-dotenv fastapi uvicorn -q
 print_success "Python dependencies installed"
 
 print_header "CONFIGURATION"
