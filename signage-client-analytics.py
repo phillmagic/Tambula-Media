@@ -11,8 +11,18 @@ from dotenv import load_dotenv
 import http.server
 import socketserver
 from urllib.parse import quote
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+_log_fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+_rot_handler = RotatingFileHandler(
+    Path(__file__).parent / 'signage-error.log',
+    maxBytes=10 * 1024 * 1024,  # 10 MB per file
+    backupCount=3               # 3 backups = 30 MB total cap
+)
+_rot_handler.setFormatter(_log_fmt)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[_rot_handler])
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 class DeviceAnalytics:
     """
@@ -193,7 +203,7 @@ class DeviceAnalytics:
             )
             
             if response.status_code == 204:
-                logging.info(f"📊 Updated uptime log: {duration_seconds}s")
+                logging.debug(f"📊 Updated uptime log: {duration_seconds}s")
             else:
                 logging.error(f"Failed to update uptime log: {response.status_code}")
                 
@@ -938,15 +948,15 @@ class SignageClient:
             advert_settings_found = False
             for schedule in self.schedules:
                 if schedule.get('is_active', False):
-                    interruption_interval = schedule.get('interruption_interval')
+                    interruption_interval = schedule.get('interrupt_duration') or schedule.get('interruption_interval')
                     advert_playlist_id = schedule.get('advert_playlist_id')
-                    
+
                     if interruption_interval and interruption_interval > 0:
                         self.advert_enabled = True
                         self.advert_interval = interruption_interval
                         self.advert_duration = 30  # Default duration for each advert
                         advert_settings_found = True
-                        logging.info(f"📺 Interruption settings loaded: {interruption_interval}s interval, {self.advert_duration}s duration")
+                        logging.info(f"📺 Interruption settings loaded: every {interruption_interval}s, plays all ads to completion")
                         if advert_playlist_id:
                             logging.info(f"📺 Advert playlist ID: {advert_playlist_id}")
                         break
@@ -959,61 +969,101 @@ class SignageClient:
             url = f"{self.supabase_url}/rest/v1/playlists"
             params = {'select': '*'}
             response = requests.get(url, headers=self.headers, params=params, timeout=10)
-            
+
             if response.status_code != 200:
                 logging.error(f"Failed to get playlists: {response.text}")
                 return False
-            
+
             all_playlists = response.json()
-            
-            # Get unique playlist IDs from schedule_items
-            scheduled_playlist_ids = list(set([item['playlist_id'] for item in self.schedule_items]))
+            playlist_map = {p['id']: p for p in all_playlists}
+
+            scheduled_playlist_ids = set(item['playlist_id'] for item in self.schedule_items)
             logging.info(f"📁 Unique playlists in schedule items: {len(scheduled_playlist_ids)}")
-            
-            # Process playlists
-            self.playlists_data = {}
-            self.advert_playlists = {}
-            
+
+            # --- Batch load all playlist_videos in one request (avoids N+1) ---
+            # Step 1: fetch all playlist_video rows (paginated past the 1000-row cap)
+            all_pv_rows = []
+            ROW_PAGE = 1000
+            pv_from = 0
+            while True:
+                pv_resp = requests.get(
+                    f"{self.supabase_url}/rest/v1/playlist_videos",
+                    headers=self.headers,
+                    params={'select': 'playlist_id,video_id,order_index', 'order': 'playlist_id,order_index',
+                            'offset': str(pv_from), 'limit': str(ROW_PAGE)},
+                    timeout=15
+                )
+                if pv_resp.status_code != 200:
+                    logging.error(f"Failed to get playlist_videos: {pv_resp.text}")
+                    break
+                batch = pv_resp.json()
+                if not batch:
+                    break
+                all_pv_rows.extend(batch)
+                if len(batch) < ROW_PAGE:
+                    break
+                pv_from += ROW_PAGE
+
+            # Step 2: collect unique video IDs, fetch video details in one request
+            video_ids = list(set(row['video_id'] for row in all_pv_rows))
+            video_map = {}
+            ID_BATCH = 200
+            for i in range(0, len(video_ids), ID_BATCH):
+                batch_ids = video_ids[i:i + ID_BATCH]
+                v_resp = requests.get(
+                    f"{self.supabase_url}/rest/v1/videos",
+                    headers=self.headers,
+                    params={'id': f'in.({",".join(batch_ids)})', 'select': 'id,filename,file_path'},
+                    timeout=15
+                )
+                if v_resp.status_code == 200:
+                    for v in v_resp.json():
+                        video_map[v['id']] = v
+
+            # Step 3: group playlist_video rows by playlist_id
+            pv_by_playlist = {}
+            for row in all_pv_rows:
+                pid = row['playlist_id']
+                vid = video_map.get(row['video_id'])
+                if vid:
+                    pv_by_playlist.setdefault(pid, []).append({
+                        'filename': vid['filename'],
+                        'file_path': vid['file_path'],
+                        'order_index': row['order_index']
+                    })
+
+            # Step 4: build new dicts locally, then swap atomically so the web
+            # server never sees a half-empty playlists_data during concurrent reloads
+            new_playlists_data = {}
+            new_advert_playlists = {}
+
             for playlist in all_playlists:
                 playlist_id = playlist['id']
                 playlist_type = playlist.get('playlist_type', 'regular')
-                
-                # Get videos in playlist
-                url = f"{self.supabase_url}/rest/v1/playlist_videos"
-                params = {
-                    'playlist_id': f'eq.{playlist_id}',
-                    'select': 'videos(id,filename,file_path),order_index',
-                    'order': 'order_index'
-                }
-                response = requests.get(url, headers=self.headers, params=params, timeout=10)
-                
-                if response.status_code == 200:
-                    playlist_videos = response.json()
-                    videos = []
-                    for pv in playlist_videos:
-                        if pv.get('videos'):
-                            video = pv['videos']
-                            videos.append({
-                                'filename': video['filename'],
-                                'file_path': video['file_path'],
-                                'order_index': pv['order_index']
-                            })
-                    
-                    playlist['videos'] = videos
-                    
-                    if playlist_type == 'advert':
-                        self.advert_playlists[playlist_id] = playlist
-                        logging.info(f"📺 Found advert playlist: '{playlist['name']}' with {len(videos)} videos")
-                    elif playlist_id in scheduled_playlist_ids:
-                        self.playlists_data[playlist_id] = playlist
-                        logging.info(f"📁 Loaded regular playlist: '{playlist['name']}' with {len(videos)} videos")
-            
-            # Pre-download videos
+                videos = sorted(pv_by_playlist.get(playlist_id, []),
+                                key=lambda x: x.get('order_index') or 0)
+                playlist['videos'] = videos
+
+                if playlist_type == 'advert':
+                    new_advert_playlists[playlist_id] = playlist
+                    logging.debug(f"📺 Found advert playlist: '{playlist['name']}' with {len(videos)} videos")
+                elif playlist_id in scheduled_playlist_ids:
+                    new_playlists_data[playlist_id] = playlist
+                    logging.debug(f"📁 Loaded regular playlist: '{playlist['name']}' with {len(videos)} videos")
+
+            # Atomic swap — never exposes an empty dict to concurrent requests
+            self.playlists_data = new_playlists_data
+            self.advert_playlists = new_advert_playlists
+
+            # Pre-download advert videos (blocking, small set)
             if self.advert_playlists and self.advert_enabled:
                 self.preload_advert_videos()
-            
+
+            # Background-download ALL group videos regardless of active schedule
+            self.preload_all_videos()
+
             logging.info(f"✅ Loaded {len(self.schedules)} schedules, {len(self.schedule_items)} schedule items, {len(self.playlists_data)} regular playlists, {len(self.advert_playlists)} advert playlists")
-            
+
             # After successful fetch, save to cache
             self.save_to_cache()
             return len(self.schedules) > 0 and len(self.schedule_items) > 0
@@ -1030,13 +1080,13 @@ class SignageClient:
                 
                 # Check for schedule/playlist updates every 30 seconds
                 if current_time - self.last_schedule_check > self.check_interval:
-                    logging.info("🔄 Checking for schedule/playlist updates...")
+                    logging.debug("🔄 Checking for schedule/playlist updates...")
                     self.get_schedules_and_playlists()
                     self.last_schedule_check = current_time
-                
+
                 # Check for settings updates every 60 seconds
                 if current_time - self.last_settings_check > 60:
-                    logging.info("🔄 Checking for settings updates...")
+                    logging.debug("🔄 Checking for settings updates...")
                     self.get_settings()
                     self.last_settings_check = current_time
                 
@@ -1050,51 +1100,98 @@ class SignageClient:
     def preload_advert_videos(self):
         """Pre-download all advert videos"""
         logging.info("⬇️ Pre-downloading advert videos...")
-        
         total_adverts = 0
         for playlist_id, playlist in self.advert_playlists.items():
             for video in playlist.get('videos', []):
                 video_path = self.download_video(video)
                 if video_path:
                     total_adverts += 1
-        
         logging.info(f"✅ Pre-downloaded {total_adverts} advert videos")
+
+    def preload_all_videos(self):
+        """Background: pre-download every video in every playlist for this group"""
+        def _run():
+            all_playlists = {**self.playlists_data, **self.advert_playlists}
+            total = sum(len(p.get('videos', [])) for p in all_playlists.values())
+            logging.info(f"⬇️  Background preload started — {total} videos across {len(all_playlists)} playlists")
+            downloaded = skipped = failed = 0
+            for playlist in all_playlists.values():
+                for video in playlist.get('videos', []):
+                    try:
+                        result = self.download_video(video)
+                        if result:
+                            local = Path(result)
+                            if local.stat().st_size > 0:
+                                skipped += 1  # already existed or just downloaded
+                            else:
+                                downloaded += 1
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        logging.error(f"Preload error {video.get('filename')}: {e}")
+                        failed += 1
+            logging.info(f"✅ Preload complete — {downloaded} new, {skipped} existing, {failed} failed")
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
     
     def get_current_playlist(self):
         """Get current active playlist based on schedule_items"""
         now = datetime.now()
         current_time = now.strftime('%H:%M:%S')
         current_day = now.strftime('%A').lower()
-        
+
         day_name_to_number = {
             'monday': 1, 'tuesday': 2, 'wednesday': 3, 'thursday': 4,
             'friday': 5, 'saturday': 6, 'sunday': 7
         }
         current_day_number = day_name_to_number.get(current_day, 1)
-        
-        # Check each schedule to see if it's active today
+
+        logging.debug(f"[schedule] time={current_time} day={current_day}({current_day_number}) schedules={len(self.schedules)} items={len(self.schedule_items)}")
+
         for schedule in self.schedules:
             if not schedule.get('is_active', False):
+                logging.debug(f"[schedule] '{schedule.get('name')}' skipped — not active")
                 continue
-                
+
             days_of_week = schedule.get('days_of_week', [])
-            if current_day_number not in days_of_week:
+            # Normalise: DB may store ints or strings — coerce both to int
+            days_normalised = []
+            for d in days_of_week:
+                try:
+                    days_normalised.append(int(d))
+                except (ValueError, TypeError):
+                    pass
+
+            if current_day_number not in days_normalised:
+                logging.debug(f"[schedule] '{schedule.get('name')}' skipped — day {current_day_number} not in {days_normalised}")
                 continue
-            
-            # Schedule is active today, check schedule_items for current time
+
             schedule_id = schedule['id']
             matching_items = [item for item in self.schedule_items if item['schedule_id'] == schedule_id]
-            
+            logging.debug(f"[schedule] '{schedule.get('name')}' active today — {len(matching_items)} items")
+
             for item in matching_items:
-                start_time = item.get('start_time', '00:00:00')
-                end_time = item.get('end_time', '23:59:59')
-                
+                # Trim any timezone suffix (e.g. "08:00:00+03" → "08:00:00")
+                start_time = (item.get('start_time') or '00:00:00')[:8]
+                end_time   = (item.get('end_time')   or '23:59:59')[:8]
+
                 if start_time <= current_time <= end_time:
                     playlist_id = item['playlist_id']
                     if playlist_id in self.playlists_data:
+                        logging.debug(f"[schedule] matched playlist {playlist_id} ({start_time}–{end_time})")
                         return self.playlists_data[playlist_id]
-        
-        # No matching schedule item found - gap in schedule
+                    else:
+                        logging.debug(f"[schedule] playlist {playlist_id} not in playlists_data")
+                else:
+                    logging.debug(f"[schedule] item {start_time}–{end_time} doesn't cover {current_time}")
+
+        logging.warning(f"[schedule] no match found for day={current_day_number} time={current_time} — falling back to first available playlist")
+        # Fallback: return the first playlist that has videos so the screen is never blank
+        for playlist in self.playlists_data.values():
+            if playlist.get('videos'):
+                logging.info(f"[schedule] fallback → '{playlist.get('name')}'")
+                return playlist
         return None
     
     def get_next_playlist(self):
@@ -1386,7 +1483,6 @@ class SignageClient:
         const mainVideos = {json.dumps(video_files)};
         const adVideos = {advert_videos_json};
         const advertEnabled = {str(self.advert_enabled).lower()};
-        const advertDuration = {self.advert_duration * 1000}; // Convert to milliseconds
         
         let currentMainVideoIndex = 0;
         let currentAdVideoIndex = 0;
@@ -1559,16 +1655,6 @@ class SignageClient:
             console.log('▶️  Main video RESUMED from', savedMainVideoTime.toFixed(2), 'seconds');
         }}
         
-        // Check if ad duration limit reached
-        function checkAdDuration() {{
-            if (isPlayingAd && adStartTime && (Date.now() - adStartTime) >= advertDuration) {{
-                console.log('⏱️  Ad duration limit reached');
-                resumeMainContent();
-                return true;
-            }}
-            return false;
-        }}
-        
         // Check for playlist updates
         async function checkForPlaylistUpdates() {{
             try {{
@@ -1731,10 +1817,6 @@ class SignageClient:
         
         // Ad video ended - move to next ad or finish
         adPlayer.addEventListener('ended', function() {{
-            if (checkAdDuration()) {{
-                return;
-            }}
-            
             currentAdVideoIndex++;
             loadAdVideo(currentAdVideoIndex);
         }});
@@ -1751,9 +1833,6 @@ class SignageClient:
         adPlayer.addEventListener('error', function() {{
             console.error('Ad video error, trying next ad');
             setTimeout(() => {{
-                if (checkAdDuration()) {{
-                    return;
-                }}
                 currentAdVideoIndex++;
                 loadAdVideo(currentAdVideoIndex);
             }}, 1000);
@@ -2021,9 +2100,16 @@ class SignageClient:
                 logging.info("   • Automatic playback logging")
                 logging.info("   • Press 'A' to manually trigger ad break (testing)")
                 logging.info("=" * 60)
-                
-                httpd.serve_forever()
-                
+
+                # Run server in a daemon thread so the main thread can handle
+                # SIGTERM without deadlocking against serve_forever()
+                server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                server_thread.start()
+
+                # Main thread waits here until signal_handler sets self.running = False
+                while self.running:
+                    time.sleep(1)
+
         except Exception as e:
             logging.error(f"Failed to start web server: {e}")
     
