@@ -13,9 +13,11 @@ import socketserver
 from urllib.parse import quote
 from logging.handlers import RotatingFileHandler
 
+_log_file = Path(__file__).parent / 'signage-error.log'
+_log_file.write_text('')  # clear on every boot
 _log_fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 _rot_handler = RotatingFileHandler(
-    Path(__file__).parent / 'signage-error.log',
+    _log_file,
     maxBytes=10 * 1024 * 1024,  # 10 MB per file
     backupCount=3               # 3 backups = 30 MB total cap
 )
@@ -534,12 +536,29 @@ class SyncManager:
             if response.status_code == 200:
                 self.client.schedules = response.json()
                 logging.info(f"   📅 Synced {len(self.client.schedules)} schedules")
-            
-            # Playlists
+                # Apply advert settings from schedules
+                for schedule in self.client.schedules:
+                    if schedule.get('is_active', False):
+                        interval = schedule.get('interrupt_duration') or schedule.get('interruption_interval')
+                        if interval and interval > 0:
+                            self.client.advert_enabled = True
+                            self.client.advert_interval = interval
+                            break
+
+            # Playlists — split regular vs advert so ads work correctly
             response = requests.get(f"{base_url}/api/playlists", timeout=10)
             if response.status_code == 200:
-                self.client.playlists_data = response.json()
-                logging.info(f"   📁 Synced {len(self.client.playlists_data)} playlists")
+                all_playlists = response.json()
+                new_regular = {}
+                new_advert = {}
+                for pid, playlist in all_playlists.items():
+                    if playlist.get('playlist_type') == 'advert':
+                        new_advert[pid] = playlist
+                    else:
+                        new_regular[pid] = playlist
+                self.client.playlists_data = new_regular
+                self.client.advert_playlists = new_advert
+                logging.info(f"   📁 Synced {len(new_regular)} regular + {len(new_advert)} advert playlists")
             
             # Settings
             response = requests.get(f"{base_url}/api/settings", timeout=10)
@@ -704,6 +723,9 @@ class SignageClient:
         self.last_advert_time = time.time()
         self.advert_active = False
         
+        # Track URLs that returned non-200 so we don't hammer them every cycle
+        self._failed_urls = set()
+
         # Background refresh thread
         self.refresh_thread = None
         self.running = True
@@ -1178,9 +1200,17 @@ class SignageClient:
 
                 if start_time <= current_time <= end_time:
                     playlist_id = item['playlist_id']
-                    if playlist_id in self.playlists_data:
-                        logging.debug(f"[schedule] matched playlist {playlist_id} ({start_time}–{end_time})")
-                        return self.playlists_data[playlist_id]
+                    playlist = self.playlists_data.get(playlist_id)
+                    if playlist:
+                        videos = playlist.get('videos', [])
+                        # Only return playlist if it has at least one video file on disk
+                        local_videos = [v for v in videos
+                                        if (self.videos_dir / v['filename']).exists()]
+                        if local_videos:
+                            logging.debug(f"[schedule] matched playlist {playlist_id} ({start_time}–{end_time})")
+                            return playlist
+                        else:
+                            logging.warning(f"[schedule] playlist '{playlist.get('name')}' matched but has no local videos — skipping")
                     else:
                         logging.debug(f"[schedule] playlist {playlist_id} not in playlists_data")
                 else:
@@ -1281,16 +1311,34 @@ class SignageClient:
                         break
                 download_url = f"{self.supabase_url}/storage/v1/object/public/videos/{quote(clean_path)}"
             
+            if download_url in self._failed_urls:
+                return None
+
             logging.info(f"⬇️ Downloading: {video['filename']}")
             response = requests.get(download_url, stream=True, timeout=30)
-            
+
+            # If 400 and URL has single /videos/ (missing subfolder), retry with /videos/videos/
+            if response.status_code == 400 and '/storage/v1/object/public/videos/' in download_url \
+                    and '/storage/v1/object/public/videos/videos/' not in download_url:
+                alt_url = download_url.replace(
+                    '/storage/v1/object/public/videos/',
+                    '/storage/v1/object/public/videos/videos/',
+                    1
+                )
+                logging.warning(f"↩️ Retrying with corrected path: {alt_url[:120]}")
+                response = requests.get(alt_url, stream=True, timeout=30)
+                if response.status_code == 200:
+                    download_url = alt_url  # use corrected URL for the write
+
             if response.status_code == 200:
                 with open(local_path, 'wb') as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         f.write(chunk)
                 logging.info(f"✅ Downloaded: {video['filename']}")
                 return str(local_path)
-            
+
+            self._failed_urls.add(download_url)
+            logging.error(f"❌ Download failed {video['filename']}: HTTP {response.status_code} — URL: {download_url[:120]}")
             return None
                 
         except Exception as e:

@@ -27,14 +27,19 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/park-server.log'),
-        logging.StreamHandler()
-    ]
-)
+from logging.handlers import RotatingFileHandler as _RFH
+_log_fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+_log_handlers: list = [logging.StreamHandler()]
+try:
+    os.makedirs('logs', exist_ok=True)
+    open('logs/park-server.log', 'w').close()  # clear on boot
+    _rfh = _RFH('logs/park-server.log', maxBytes=10 * 1024 * 1024, backupCount=3)
+    _rfh.setFormatter(_log_fmt)
+    _log_handlers.insert(0, _rfh)
+except (PermissionError, OSError) as _e:
+    print(f"Warning: cannot write log file: {_e} — console only")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=_log_handlers)
 
 # Load environment variables
 load_dotenv()
@@ -334,7 +339,7 @@ class EnhancedParkServer:
                     
                     # Download logo if exists
                     if key == 'logo' and file_path:
-                        logo_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{file_path}"
+                        logo_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{quote(file_path)}"
                         logo_dest = ASSETS_DIR / Path(file_path).name
                         self.download_file(logo_url, logo_dest, f"Logo: {Path(file_path).name}")
                         server_state['settings'][key]['local_path'] = str(logo_dest)
@@ -370,8 +375,23 @@ class EnhancedParkServer:
         """Download file from Supabase with progress"""
         try:
             logging.info(f"⬇️  Downloading: {desc or destination.name}")
-            
+            logging.debug(f"   URL: {url}")
+
             response = requests.get(url, stream=True, timeout=30)
+
+            # If 400 and URL has single /videos/ (missing subfolder), retry with /videos/videos/
+            if response.status_code == 400 and '/storage/v1/object/public/videos/' in url \
+                    and '/storage/v1/object/public/videos/videos/' not in url:
+                alt_url = url.replace(
+                    '/storage/v1/object/public/videos/',
+                    '/storage/v1/object/public/videos/videos/',
+                    1
+                )
+                logging.warning(f"↩️ Retrying with corrected path: {alt_url[:120]}")
+                response = requests.get(alt_url, stream=True, timeout=30)
+                if response.status_code == 200:
+                    url = alt_url
+
             if response.status_code != 200:
                 logging.error(
                     f"Failed to download {desc}: HTTP {response.status_code} | "
@@ -456,36 +476,65 @@ class EnhancedParkServer:
             
             all_playlists = response.json()
             server_state['playlists'] = {}
-            
-            # Get videos for each playlist
+
+            # Step 1: Fetch ALL playlist_videos in paginated batches (avoids N+1 and embedded join)
+            all_pv_rows = []
+            offset = 0
+            PAGE = 1000
+            while True:
+                pv_resp = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/playlist_videos",
+                    headers=HEADERS,
+                    params={'select': 'playlist_id,video_id,order_index', 'order': 'order_index',
+                            'offset': offset, 'limit': PAGE},
+                    timeout=15
+                )
+                if pv_resp.status_code != 200:
+                    logging.error(f"Failed to get playlist_videos: {pv_resp.text}")
+                    break
+                batch = pv_resp.json()
+                all_pv_rows.extend(batch)
+                if len(batch) < PAGE:
+                    break
+                offset += PAGE
+            logging.info(f"📋 Fetched {len(all_pv_rows)} playlist_video rows")
+
+            # Step 2: Batch fetch video metadata by ID (chunks of 200)
+            video_ids = list({row['video_id'] for row in all_pv_rows if row.get('video_id')})
+            video_map = {}
+            CHUNK = 200
+            for i in range(0, len(video_ids), CHUNK):
+                chunk = video_ids[i:i + CHUNK]
+                v_resp = requests.get(
+                    f"{SUPABASE_URL}/rest/v1/videos",
+                    headers=HEADERS,
+                    params={'id': f'in.({",".join(chunk)})', 'select': 'id,filename,file_path'},
+                    timeout=15
+                )
+                if v_resp.status_code == 200:
+                    for v in v_resp.json():
+                        video_map[v['id']] = v
+
+            # Step 3: Group playlist_video rows by playlist_id
+            pv_by_playlist = {}
+            for row in all_pv_rows:
+                pid = row['playlist_id']
+                vid = video_map.get(row.get('video_id'))
+                if vid:
+                    pv_by_playlist.setdefault(pid, []).append({
+                        'filename': vid['filename'],
+                        'file_path': vid['file_path'],
+                        'order_index': row.get('order_index') or 0
+                    })
+
+            # Attach videos to each playlist
             for playlist in all_playlists:
                 playlist_id = playlist['id']
-                
-                url = f"{SUPABASE_URL}/rest/v1/playlist_videos"
-                params = {
-                    'playlist_id': f'eq.{playlist_id}',
-                    'select': 'videos(id,filename,file_path),order_index',
-                    'order': 'order_index'
-                }
-                response = requests.get(url, headers=HEADERS, params=params, timeout=10)
-                
-                if response.status_code == 200:
-                    playlist_videos = response.json()
-                    videos = []
-                    
-                    for pv in playlist_videos:
-                        if pv.get('videos'):
-                            video = pv['videos']
-                            videos.append({
-                                'filename': video['filename'],
-                                'file_path': video['file_path'],
-                                'order_index': pv['order_index']
-                            })
-                    
-                    playlist['videos'] = videos
-                    server_state['playlists'][playlist_id] = playlist
-                    
-                    logging.info(f"📁 Playlist '{playlist['name']}': {len(videos)} videos")
+                videos = sorted(pv_by_playlist.get(playlist_id, []),
+                                key=lambda x: x['order_index'])
+                playlist['videos'] = videos
+                server_state['playlists'][playlist_id] = playlist
+                logging.info(f"📁 Playlist '{playlist['name']}' ({playlist.get('playlist_type','regular')}): {len(videos)} videos")
             
             # Save to cache
             with open(CACHE_DIR / 'schedules.json', 'w') as f:
@@ -536,18 +585,22 @@ class EnhancedParkServer:
                     logging.info(f"⏭️  Skipping (exists): {filename}")
                     continue
                 
-                # Build download URL — file_path in DB is stored as a full public URL
-                # (VideoManagement.tsx stores getPublicUrl() result directly), so use it
-                # as-is. For older records stored as a relative path, construct the URL.
+                # Normalise file_path before building the URL:
+                # 1. If stored as a full URL, use it directly (strip nothing)
+                # 2. If stored with a "videos/" bucket-name prefix, strip it (avoids /videos/videos/...)
+                # 3. Otherwise use as-is
                 if file_path and file_path.startswith('http'):
-                    download_url = file_path
+                    download_url = file_path  # already a full URL
                 else:
                     clean_path = file_path or filename
+                    # Strip leading bucket-name prefix if present
                     for prefix in ('videos/', '/videos/'):
                         if clean_path.startswith(prefix):
                             clean_path = clean_path[len(prefix):]
                             break
                     download_url = f"{SUPABASE_URL}/storage/v1/object/public/videos/{quote(clean_path)}"
+
+                logging.info(f"   file_path='{file_path}'  →  {download_url}")
                 if self.download_file(download_url, local_path, f"Video: {filename}"):
                     downloaded_count += 1
                 else:
