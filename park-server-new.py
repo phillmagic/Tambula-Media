@@ -22,7 +22,7 @@ from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -269,9 +269,24 @@ class EnhancedParkServer:
                 logging.error(f"Error in heartbeat loop: {e}")
                 time.sleep(10)
     
-    def track_device_heartbeat(self, device_id: str, client_ip: str, status: str = 'online', 
-                             current_video: str = None, uptime_seconds: int = 0):
+    def track_device_heartbeat(self, device_id: str, client_ip: str, status: str = 'online',
+                             current_video: str = None, uptime_seconds: int = 0, sync_info: dict = None, device_name: str = ''):
         """Track device heartbeat and status"""
+        # Always update in-memory state — Supabase persistence is best-effort
+        server_state['connected_devices'][device_id] = {
+            'device_name': device_name,
+            'client_ip': client_ip,
+            'status': status,
+            'current_video': current_video,
+            'uptime_seconds': uptime_seconds,
+            'sync': sync_info or {},
+            'last_seen': datetime.now().isoformat()
+        }
+        logging.info(f"💓 Heartbeat from {device_id} ({client_ip}) uptime={uptime_seconds}s")
+
+        # Persist to Supabase if configured
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            return
         try:
             heartbeat_data = {
                 'device_id': device_id,
@@ -282,37 +297,23 @@ class EnhancedParkServer:
                 'uptime_seconds': uptime_seconds,
                 'last_sync': datetime.now().isoformat()
             }
-            
-            # Upsert device heartbeat - using simple table name
+
             url = f"{SUPABASE_URL}/rest/v1/device_heartbeats"
-            
-            # Check if heartbeat exists
             params = {
                 'device_id': f'eq.{device_id}',
                 'server_id': f'eq.{self.server_id}',
                 'select': 'id'
             }
-            
-            response = requests.get(url, headers=SERVICE_HEADERS, params=params)
-            
+            response = requests.get(url, headers=SERVICE_HEADERS, params=params, timeout=5)
+
             if response.status_code == 200 and response.json():
-                # Update existing heartbeat
                 existing_id = response.json()[0]['id']
-                params = {'id': f'eq.{existing_id}'}
-                response = requests.patch(url, headers=SERVICE_HEADERS, params=params, json=heartbeat_data)
+                requests.patch(url, headers=SERVICE_HEADERS, params={'id': f'eq.{existing_id}'}, json=heartbeat_data, timeout=5)
             else:
-                # Create new heartbeat
-                response = requests.post(url, headers=SERVICE_HEADERS, json=heartbeat_data)
-            
-            if response.status_code in [201, 204]:
-                server_state['connected_devices'][device_id] = {
-                    'client_ip': client_ip,
-                    'status': status,
-                    'last_seen': datetime.now().isoformat()
-                }
-                
+                requests.post(url, headers=SERVICE_HEADERS, json=heartbeat_data, timeout=5)
+
         except Exception as e:
-            logging.error(f"Error tracking device heartbeat: {e}")
+            logging.warning(f"Supabase heartbeat persistence failed (non-critical): {e}")
 
     def sync_settings(self) -> bool:
         """Sync settings from Supabase"""
@@ -818,9 +819,11 @@ async def status():
     return {
         "status": "online",
         "server_id": server_state['server_id'],
+        "server_name": SERVER_NAME,
         "server_time": datetime.now().isoformat(),
         "last_sync": server_state['last_sync'],
         "sync_in_progress": server_state['sync_in_progress'],
+        "sync_interval": SYNC_INTERVAL,
         "connected_devices": len(server_state['connected_devices']),
         "stats": {
             "total_files": server_state['total_files'],
@@ -831,6 +834,229 @@ async def status():
             "assets": len(server_state['manifest'].get('assets', {}))
         }
     }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """Visual dashboard for monitoring bus sync status"""
+    return HTMLResponse(content="""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tambula Park Server</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:24px}
+  h1{font-size:1.4rem;font-weight:700;color:#f8fafc}
+  h2{font-size:0.85rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;margin-bottom:12px}
+  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;flex-wrap:gap}
+  .header-left{display:flex;align-items:center;gap:12px}
+  .dot{width:10px;height:10px;border-radius:50%;background:#22c55e;box-shadow:0 0 8px #22c55e}
+  .dot.syncing{background:#f59e0b;box-shadow:0 0 8px #f59e0b;animation:pulse 1s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .refresh-info{font-size:0.75rem;color:#64748b}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-bottom:28px}
+  .card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:18px}
+  .card .val{font-size:1.9rem;font-weight:700;color:#f8fafc;line-height:1}
+  .card .lbl{font-size:0.75rem;color:#94a3b8;margin-top:6px}
+  .card .sub{font-size:0.7rem;color:#475569;margin-top:4px}
+  .section{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:20px;margin-bottom:20px}
+  table{width:100%;border-collapse:collapse;font-size:0.82rem}
+  th{text-align:left;padding:8px 12px;color:#64748b;font-weight:600;font-size:0.75rem;text-transform:uppercase;border-bottom:1px solid #334155}
+  td{padding:10px 12px;border-bottom:1px solid #1e293b;vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#0f172a}
+  .badge{display:inline-block;padding:2px 8px;border-radius:9999px;font-size:0.7rem;font-weight:600}
+  .badge.online{background:#14532d;color:#4ade80}
+  .badge.offline{background:#3b0000;color:#f87171}
+  .badge.syncing{background:#431407;color:#fb923c}
+  .btn{padding:8px 18px;border-radius:7px;border:none;font-size:0.82rem;font-weight:600;cursor:pointer;transition:opacity .15s}
+  .btn-sync{background:#3b82f6;color:#fff}
+  .btn-sync:hover{opacity:.85}
+  .btn-sync:disabled{background:#334155;color:#64748b;cursor:not-allowed}
+  .sync-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+  .empty{text-align:center;padding:32px;color:#475569;font-size:0.85rem}
+  .uptime{font-family:monospace;font-size:0.78rem;color:#94a3b8}
+  .video-cell{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#94a3b8;font-size:0.78rem}
+  .ip{font-family:monospace;font-size:0.78rem}
+  #syncMsg{font-size:0.78rem;color:#f59e0b;margin-left:12px;display:none}
+  .last-sync{font-size:0.75rem;color:#64748b;margin-top:4px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="dot" id="serverDot"></div>
+    <h1 id="serverTitle">Tambula Park Server</h1>
+  </div>
+  <span class="refresh-info" id="refreshInfo">Loading...</span>
+</div>
+
+<!-- Stats row -->
+<div class="grid">
+  <div class="card"><div class="val" id="statDevices">—</div><div class="lbl">Connected Buses</div></div>
+  <div class="card"><div class="val" id="statVideos">—</div><div class="lbl">Videos</div><div class="sub" id="statSize"></div></div>
+  <div class="card"><div class="val" id="statPlaylists">—</div><div class="lbl">Playlists</div></div>
+  <div class="card"><div class="val" id="statSchedules">—</div><div class="lbl">Schedules</div></div>
+</div>
+
+<!-- Sync control + last sync -->
+<div class="section">
+  <div class="sync-row">
+    <div>
+      <h2>Sync Status</h2>
+      <div class="last-sync" id="lastSync">Last sync: —</div>
+      <div class="last-sync" id="nextSync" style="margin-top:2px"></div>
+      <div class="last-sync" id="syncFiles" style="margin-top:2px"></div>
+    </div>
+    <div style="display:flex;align-items:center">
+      <span id="syncMsg">Sync triggered...</span>
+      <button class="btn btn-sync" id="syncBtn" onclick="triggerSync()">Sync Now</button>
+    </div>
+  </div>
+</div>
+
+<!-- Devices table -->
+<div class="section">
+  <h2>Connected Buses</h2>
+  <div id="devicesBody">
+    <div class="empty">Loading devices...</div>
+  </div>
+</div>
+
+<script>
+  function fmt(seconds) {
+    if (!seconds) return '—';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    return h > 0 ? h + 'h ' + m + 'm' : m + 'm';
+  }
+
+  function timeAgo(iso) {
+    if (!iso) return '—';
+    const diff = Math.floor((Date.now() - new Date(iso)) / 1000);
+    if (diff < 60) return diff + 's ago';
+    if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+    return Math.floor(diff / 86400) + 'd ago';
+  }
+
+  async function refresh() {
+    try {
+      const [statusRes, devicesRes] = await Promise.all([
+        fetch('/status'),
+        fetch('/api/devices')
+      ]);
+      const status = await statusRes.json();
+      const devicesData = await devicesRes.json();
+
+      // Update dot
+      const dot = document.getElementById('serverDot');
+      dot.className = 'dot' + (status.sync_in_progress ? ' syncing' : '');
+      if (status.server_name) document.getElementById('serverTitle').textContent = status.server_name;
+
+      // Stats
+      document.getElementById('statDevices').textContent = status.connected_devices ?? 0;
+      document.getElementById('statVideos').textContent = status.stats.videos ?? 0;
+      document.getElementById('statSize').textContent = status.stats.total_size_mb + ' MB';
+      document.getElementById('statPlaylists').textContent = status.stats.playlists ?? 0;
+      document.getElementById('statSchedules').textContent = status.stats.schedules ?? 0;
+
+      // Last sync
+      document.getElementById('lastSync').textContent =
+        'Last sync: ' + (status.last_sync ? new Date(status.last_sync).toLocaleString() : 'Never');
+      if (status.last_sync && status.sync_interval) {
+        const nextMs = new Date(status.last_sync).getTime() + status.sync_interval * 1000;
+        const diffMin = Math.max(0, Math.round((nextMs - Date.now()) / 60000));
+        document.getElementById('nextSync').textContent =
+          status.sync_in_progress ? 'Syncing now...' : 'Next sync: ' + (diffMin <= 0 ? 'due now' : 'in ' + diffMin + 'm');
+      }
+      const s = status.stats;
+      document.getElementById('syncFiles').textContent =
+        s ? s.videos + ' videos · ' + s.playlists + ' playlists · ' + s.schedules + ' schedules · ' + s.total_size_mb + ' MB' : '';
+
+      // Sync button
+      const btn = document.getElementById('syncBtn');
+      btn.disabled = status.sync_in_progress;
+      btn.textContent = status.sync_in_progress ? 'Syncing...' : 'Sync Now';
+
+      // Devices table
+      const devices = devicesData.devices || {};
+      const keys = Object.keys(devices);
+      const container = document.getElementById('devicesBody');
+
+      if (keys.length === 0) {
+        container.innerHTML = '<div class="empty">No buses connected yet. Buses appear here once they send a heartbeat.</div>';
+      } else {
+        const rows = keys.map(id => {
+          const d = devices[id];
+          const lastSeen = d.last_seen || d.last_heartbeat;
+          const seenAgo = timeAgo(lastSeen);
+          const isRecent = lastSeen && (Date.now() - new Date(lastSeen)) < 120000;
+          const badgeClass = isRecent ? 'online' : 'offline';
+          const badgeText = isRecent ? 'Online' : 'Offline';
+          const nowPlaying = d.current_video || '—';
+          const sy = d.sync || {};
+          let syncCell = '—';
+          if (sy.total > 0) {
+            if (sy.active) {
+              syncCell = '<span style="color:#f59e0b">⬇ Syncing... (' + sy.pending + ' left)</span>';
+            } else if (sy.pending > 0) {
+              syncCell = '<span style="color:#f59e0b">⚠ ' + sy.pending + ' pending</span>';
+            } else {
+              syncCell = '<span style="color:#4ade80">✓ Synced (' + sy.local + '/' + sy.total + ')</span>';
+            }
+          }
+          const nameLabel = d.device_name || d.client_ip || '—';
+          const ipLabel = d.device_name ? d.client_ip || '' : '';
+          return '<tr>' +
+            '<td class="ip"><strong>' + nameLabel + '</strong>' + (ipLabel ? '<br><span style="font-weight:400;color:#64748b">' + ipLabel + '</span>' : '') + '</td>' +
+            '<td><span class="badge ' + badgeClass + '">' + badgeText + '</span></td>' +
+            '<td class="video-cell" title="' + nowPlaying + '">' + nowPlaying + '</td>' +
+            '<td class="uptime">' + syncCell + '</td>' +
+            '<td class="uptime">' + fmt(d.uptime_seconds) + '</td>' +
+            '<td class="uptime">' + seenAgo + '</td>' +
+            '</tr>';
+        }).join('');
+
+        container.innerHTML = '<table>' +
+          '<thead><tr>' +
+          '<th>IP Address</th><th>Status</th><th>Now Playing</th><th>Content Sync</th><th>Uptime</th><th>Last Seen</th>' +
+          '</tr></thead>' +
+          '<tbody>' + rows + '</tbody>' +
+          '</table>';
+      }
+
+      // Refresh timestamp
+      document.getElementById('refreshInfo').textContent =
+        'Updated ' + new Date().toLocaleTimeString();
+
+    } catch(e) {
+      document.getElementById('refreshInfo').textContent = 'Error loading data';
+    }
+  }
+
+  async function triggerSync() {
+    const btn = document.getElementById('syncBtn');
+    const msg = document.getElementById('syncMsg');
+    btn.disabled = true;
+    msg.style.display = 'inline';
+    try {
+      await fetch('/api/sync/trigger', { method: 'POST' });
+      setTimeout(() => { msg.style.display = 'none'; refresh(); }, 2000);
+    } catch(e) {
+      msg.textContent = 'Failed to trigger sync';
+      setTimeout(() => { msg.style.display = 'none'; btn.disabled = false; }, 3000);
+    }
+  }
+
+  refresh();
+  setInterval(refresh, 30000);
+</script>
+</body>
+</html>""")
 
 
 @app.get("/api/analytics")
@@ -860,15 +1086,23 @@ async def device_heartbeat(request: Request, heartbeat_data: dict):
     client_ip = request.client.host
     
     device_id = heartbeat_data.get('device_id')
+    device_name = heartbeat_data.get('device_name', '')
     status = heartbeat_data.get('status', 'online')
     current_video = heartbeat_data.get('current_video')
     uptime_seconds = heartbeat_data.get('uptime_seconds', 0)
-    
+    sync_info = {
+        'total':   heartbeat_data.get('sync_total', 0),
+        'local':   heartbeat_data.get('sync_local', 0),
+        'pending': heartbeat_data.get('sync_pending', 0),
+        'active':  heartbeat_data.get('sync_active', False),
+        'last':    heartbeat_data.get('sync_last')
+    }
+
     if not device_id:
         raise HTTPException(status_code=400, detail="device_id is required")
-    
+
     # Track device heartbeat
-    enhanced_server.track_device_heartbeat(device_id, client_ip, status, current_video, uptime_seconds)
+    enhanced_server.track_device_heartbeat(device_id, client_ip, status, current_video, uptime_seconds, sync_info, device_name)
     
     # Log analytics
     enhanced_server.log_analytics(

@@ -241,7 +241,30 @@ class DeviceAnalytics:
                 self.last_heartbeat = time.time()
             else:
                 logging.error(f"Failed to send heartbeat: {response.status_code}")
-                
+
+            # Also notify park server so it can track connected devices
+            if self.client.sync_manager.park_server_ip:
+                try:
+                    park_url = (f"http://{self.client.sync_manager.park_server_ip}:"
+                                f"{self.client.sync_manager.park_server_port}/api/devices/heartbeat")
+                    current_playlist = self.client.get_current_playlist()
+                    ss = self.client.sync_manager.sync_status
+                    requests.post(park_url, json={
+                        'device_id': self.device_uuid,
+                        'device_name': os.getenv('DEVICE_NAME', ''),
+                        'status': 'online',
+                        'uptime_seconds': current_uptime,
+                        'current_video': current_playlist['name'] if current_playlist else None,
+                        'sync_total': ss['total'],
+                        'sync_local': ss['local'],
+                        'sync_pending': ss['pending'],
+                        'sync_active': ss['active'],
+                        'sync_last': ss['last_sync']
+                    }, timeout=5)
+                    logging.info(f"💓 Park server heartbeat sent to {park_url}")
+                except Exception:
+                    pass  # Park server unreachable — not critical
+
         except Exception as e:
             logging.error(f"Error sending heartbeat: {e}")
     
@@ -378,6 +401,15 @@ class SyncManager:
         self.last_sync_time = 0
         self.sync_in_progress = False
         self.last_sync_source = None  # 'park', 'supabase', or 'failed'
+
+        # Per-file sync progress (reported in heartbeat)
+        self.sync_status = {
+            'total': 0,    # total files the park server has
+            'local': 0,    # files present locally
+            'pending': 0,  # files still to download
+            'active': False,
+            'last_sync': None
+        }
         
         # Manifest tracking
         self.local_manifest = self.load_local_manifest()
@@ -469,58 +501,67 @@ class SyncManager:
                         'modified': park_meta['modified']
                     })
             
+            self.sync_status['total'] = len(park_videos)
+            self.sync_status['local'] = len(park_videos) - len(updates_needed)
+            self.sync_status['pending'] = len(updates_needed)
+
             if not updates_needed:
+                self.sync_status['active'] = False
+                self.sync_status['last_sync'] = datetime.now().isoformat()
                 logging.info(f"✅ All videos up to date ({len(park_videos)} files)")
                 return True
-            
+
             logging.info(f"📥 Downloading {len(updates_needed)} video(s)...")
-            
+            self.sync_status['active'] = True
+
             # Step 3: Download new/updated videos
             downloaded = 0
             for update in updates_needed:
                 filename = update['filename']
                 video_path = self.client.videos_dir / filename
-                
+
                 try:
                     url = f"{base_url}/api/videos/{filename}"
                     logging.info(f"   ⬇️  {filename} ({update['reason']})")
-                    
+
                     response = requests.get(url, stream=True, timeout=30)
                     if response.status_code == 200:
-                        total_size = int(response.headers.get('content-length', 0))
-                        
                         with open(video_path, 'wb') as f:
                             downloaded_bytes = 0
                             for chunk in response.iter_content(chunk_size=8192):
                                 if chunk:
                                     f.write(chunk)
                                     downloaded_bytes += len(chunk)
-                        
-                        # Update manifest
+
                         self.local_manifest['videos'][filename] = {
                             'filename': filename,
                             'size': video_path.stat().st_size,
                             'modified': update['modified'],
                             'synced_at': time.time()
                         }
-                        
+
                         downloaded += 1
+                        self.sync_status['local'] += 1
+                        self.sync_status['pending'] -= 1
                         logging.info(f"   ✅ {filename} ({downloaded_bytes / 1024 / 1024:.1f} MB)")
                     else:
                         logging.error(f"   ❌ Failed: {filename} (HTTP {response.status_code})")
-                        
+
                 except Exception as e:
                     logging.error(f"   ❌ Error downloading {filename}: {e}")
-            
+
+            self.sync_status['active'] = False
+            self.sync_status['last_sync'] = datetime.now().isoformat()
+
             # Step 4: Sync metadata (schedules, playlists, settings)
             self.sync_metadata_from_park(base_url)
-            
+
             # Step 5: Update manifest
             self.local_manifest['last_sync'] = time.time()
             self.local_manifest['source'] = 'park'
             self.local_manifest['generated_at'] = datetime.now().isoformat()
             self.save_local_manifest()
-            
+
             logging.info(f"✅ Park sync complete: {downloaded}/{len(updates_needed)} downloaded")
             return True
             
